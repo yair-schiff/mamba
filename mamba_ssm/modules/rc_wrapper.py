@@ -26,7 +26,7 @@ class RCPSEmbedding(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
         # Project down so that final output has correct expected shape: (batch_size, seq_len, d_model)
         assert d_model % 2 == 0, "d_model must be even!"
-        self.proj = nn.Linear(d_model, d_model // 2, **factory_kwargs)
+        self.proj = nn.Linear(d_model, d_model // 2, bias=False, **factory_kwargs)
 
     @property
     def weight(self):
@@ -84,7 +84,7 @@ class RCPSWrapperKeepDim(RCPSWrapper):
         super().__init__(submodule)
         self.submodule = submodule
         assert dim % 2 == 0, "dim must be even!"
-        self.proj = nn.Linear(dim, dim // 2, **factory_kwargs)
+        self.proj = nn.Linear(dim, dim // 2, bias=False, **factory_kwargs)
 
     def forward(self, x, **kwargs):
         """Reverse-complement equivariant forward pass that maintains output dimensionality by projecting down
@@ -101,6 +101,80 @@ class RCPSWrapperKeepDim(RCPSWrapper):
 
         # Concatenate along channel dimension (dim=-1)
         return torch.cat([fwd_out, self.rc(rc_out)], dim=-1)
+
+
+class RCPSMambaBlockWrapper(nn.Module):
+    """Wrapper around MambaBlocks.
+    """
+    def __init__(self, submodule: nn.Module):
+        super().__init__()
+        self.submodule = submodule
+
+    @staticmethod
+    def rc(x):
+        """Reverse-complement a tensor by flipping the length (dim=-2) and channel (dim=-1) dimensions."""
+        return torch.flip(x, dims=[-2, -1])
+
+    def forward(self, x, residual=None, **kwargs):
+        """Reverse-complement equivariant forward pass that maintains output dimensionality by projecting down
+        forward and reverse strands.
+
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, channels)
+            residual: Input tensor of shape (batch_size, seq_len, channels) or None
+        """
+        # Run mamba_block along sequence
+        fwd_out = self.submodule(x, residual=residual, **kwargs)
+        fwd_hidden, fwd_residual = fwd_out[0], fwd_out[1]
+
+        # Run mamba_block along rc-sequence
+        rc_residual = self.rc(residual) if residual is not None else None
+        rc_out = self.submodule(self.rc(x), residual=rc_residual, **kwargs)
+        rc_hidden, rc_residual = rc_out[0], rc_out[1]
+
+        hidden = torch.cat([fwd_hidden, self.rc(rc_hidden)], dim=-1)
+        residual = torch.cat([fwd_residual, self.rc(rc_residual)], dim=-1)
+        # Concatenate along channel dimension (dim=-1)
+        return hidden, residual
+
+
+class RCPSMambaBlockWrapperKeepDims(RCPSMambaBlockWrapper):
+    """Wrapper around MambaBlocks that keeps d_model consistent.
+    """
+    def __init__(self, submodule: nn.Module, dim: int, **factory_kwargs):
+        super().__init__(submodule)
+        assert dim % 2 == 0, "dim must be even!"
+        self.hid_proj = nn.Linear(dim, dim // 2, bias=False, **factory_kwargs)
+        if self.submodule.residual_in_fp32:
+            factory_kwargs["dtype"] = torch.float32
+        self.res_proj = nn.Linear(dim, dim // 2, bias=False, **factory_kwargs)
+
+    @staticmethod
+    def rc(x):
+        """Reverse-complement a tensor by flipping the length (dim=-2) and channel (dim=-1) dimensions."""
+        return torch.flip(x, dims=[-2, -1])
+
+    def forward(self, x, residual=None, **kwargs):
+        """Reverse-complement equivariant forward pass that maintains output dimensionality by projecting down
+        forward and reverse strands.
+
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, channels)
+            residual: Input tensor of shape (batch_size, seq_len, channels) or None
+        """
+        # Run mamba_block along sequence
+        fwd_out = self.submodule(x, residual=residual, **kwargs)
+        fwd_hidden, fwd_residual = self.hid_proj(fwd_out[0]), self.res_proj(fwd_out[1])
+
+        # Run mamba_block along rc-sequence
+        rc_residual = self.rc(residual) if residual is not None else None
+        rc_out = self.submodule(self.rc(x), residual=rc_residual, **kwargs)
+        rc_hidden, rc_residual = self.hid_proj(rc_out[0]), self.res_proj(rc_out[1])
+
+        hidden = torch.cat([fwd_hidden, self.rc(rc_hidden)], dim=-1)
+        residual = torch.cat([fwd_residual, self.rc(rc_residual)], dim=-1)
+        # Concatenate along channel dimension (dim=-1)
+        return hidden, residual
 
 
 class RCPSAddNormWrapper(nn.Module):
@@ -126,8 +200,8 @@ class RCPSAddNormWrapper(nn.Module):
         residual_rc = self.rc(x) + self.rc(residual) if residual is not None else self.rc(x)
         x_rc = self.norm_f(residual_rc.to(dtype=self.norm_f.weight.dtype))
 
-        residual = torch.cat([residual_fwd, self.rc(residual_rc)], dim=2)
-        x = torch.cat([x_fwd, self.rc(x_rc)], dim=2)
+        residual = torch.cat([residual_fwd, self.rc(residual_rc)], dim=-1)
+        x = torch.cat([x_fwd, self.rc(x_rc)], dim=-1)
         return x, residual
 
 
@@ -149,8 +223,8 @@ class RCPSAddNormWrapperKeepDim(RCPSAddNormWrapper):
         residual_rc = self.res_proj(self.rc(x) + self.rc(residual) if residual is not None else self.rc(x))
         x_rc = self.norm_f(residual_rc.to(dtype=self.norm_f.weight.dtype))
 
-        residual = torch.cat([residual_fwd, self.rc(residual_rc)], dim=2)
-        x = torch.cat([x_fwd, self.rc(x_rc)], dim=2)
+        residual = torch.cat([residual_fwd, self.rc(residual_rc)], dim=-1)
+        x = torch.cat([x_fwd, self.rc(x_rc)], dim=-1)
         return x, residual
 
 
@@ -162,6 +236,7 @@ class RCPSLMHead(nn.Module):
         equivariant, i.e. 0.5 times the actual input dim.
         """
         super().__init__()
+        self.true_dim = true_dim
         self.lm_head = nn.Linear(true_dim, vocab_size, bias=False, **factory_kwargs)
 
     @property
@@ -179,8 +254,9 @@ class RCPSLMHead(nn.Module):
             x: Input tensor of shape (batch_size, seq_len, dim), where dim = 2 * true_dim.
         """
         n_channels = x.shape[-1]
-        fwd_logits = F.linear(x[..., :n_channels // 2], self.weight)
-        rc_logits = F.linear(torch.flip(x[..., n_channels // 2:], dims=[-1]), self.weight)
+        assert n_channels == 2 * self.true_dim, "Input must have 2 * true_dim channels."
+        fwd_logits = F.linear(x[..., :n_channels // 2], self.weight, bias=self.lm_head.bias)
+        rc_logits = F.linear(torch.flip(x[..., n_channels // 2:], dims=[-1]), self.weight, bias=self.lm_head.bias)
         return fwd_logits + torch.flip(rc_logits, dims=[-1])
 
 

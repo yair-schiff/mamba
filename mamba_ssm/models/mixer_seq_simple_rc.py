@@ -14,50 +14,15 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
-from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock
-from mamba.mamba_ssm.models.mixer_seq_simple import MambaWrapper
-from mamba.mamba_ssm.modules.rc_wrapper import RCPSEmbedding, RCPSWrapper, RCPSWrapperKeepDim, RCPSAddNormWrapper, RCPSLMHead
+from mamba.mamba_ssm.models.mixer_seq_simple import create_block
+from mamba.mamba_ssm.modules.rc_wrapper import (
+    RCPSEmbedding, RCPSWrapper, RCPSWrapperKeepDim, RCPSMambaBlockWrapperKeepDims, RCPSAddNormWrapper, RCPSLMHead
+)
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-
-
-def create_block(
-    d_model,
-    ssm_cfg=None,
-    norm_epsilon=1e-5,
-    rms_norm=False,
-    residual_in_fp32=False,
-    fused_add_norm=False,
-    layer_idx=None,
-    bidirectional=False,
-    bidirectional_strategy=None,
-    device=None,
-    dtype=None,
-):
-    if ssm_cfg is None:
-        ssm_cfg = {}
-    factory_kwargs = {"device": device, "dtype": dtype}
-    bidirectional_kwargs = {
-        "bidirectional": bidirectional,
-        "bidirectional_strategy": bidirectional_strategy,
-    }
-    mixer_cls = partial(MambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
-    norm_cls = partial(
-        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
-    )
-    block = RCBlock(
-        d_model,
-        mixer_cls,
-        norm_cls=norm_cls,
-        fused_add_norm=fused_add_norm,
-        residual_in_fp32=residual_in_fp32,
-        **factory_kwargs,
-    )
-    block.layer_idx = layer_idx
-    return block
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
@@ -68,7 +33,7 @@ def _init_weights(
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
-    if isinstance(module, (RCPSWrapper, RCPSWrapperKeepDim)):
+    if isinstance(module, (RCPSWrapper, RCPSWrapperKeepDim, RCPSMambaBlockWrapperKeepDims)):
         module = module.submodule
     if isinstance(module, nn.Linear):
         if module.bias is not None:
@@ -125,26 +90,30 @@ class RCPSMixerModel(nn.Module):
         # the main branch (output of MLP / Mixer). The model definition is unchanged.
         # This was originally done for performance reason, i.e. fuse add + layer_norm.
         # However, we cannot use fused add norm because we need to control residual connection in RCPS manner.
-        if fused_add_norm:
-            print("WARNING: `fused_add_norm` is not supported in RCBlock. Defaulting to `False`.")
-            fused_add_norm = False
-        self.fused_add_norm = fused_add_norm
 
         self.layers = nn.ModuleList([
-            create_block(
-                d_model,
-                ssm_cfg=ssm_cfg,
-                norm_epsilon=norm_epsilon,
-                rms_norm=rms_norm,
-                residual_in_fp32=residual_in_fp32,
-                fused_add_norm=fused_add_norm,
-                layer_idx=i,
-                bidirectional=bidirectional,
-                bidirectional_strategy=bidirectional_strategy,
-                **factory_kwargs,
-            )
+            RCPSMambaBlockWrapperKeepDims(
+                submodule=create_block(
+                    d_model,
+                    ssm_cfg=ssm_cfg,
+                    norm_epsilon=norm_epsilon,
+                    rms_norm=rms_norm,
+                    residual_in_fp32=residual_in_fp32,
+                    fused_add_norm=fused_add_norm,
+                    layer_idx=i,
+                    bidirectional=bidirectional,
+                    bidirectional_strategy=bidirectional_strategy,
+                    **factory_kwargs,
+                ),
+                dim=d_model,
+                **factory_kwargs)
             for i in range(n_layer)
         ])
+
+        if fused_add_norm:
+            print("WARNING: `fused_add_norm` is not supported in RCPSMixerModel. Defaulting to `False`.")
+            fused_add_norm = False
+        self.fused_add_norm = fused_add_norm
 
         norm_cls = nn.LayerNorm if not rms_norm else RMSNorm
         self.norm_f = RCPSAddNormWrapper(norm_cls(d_model, eps=norm_epsilon, **factory_kwargs))
@@ -232,7 +201,6 @@ class RCPSMambaLMHeadModel(nn.Module, GenerationMixin):
         self.tie_weights()
 
     def tie_weights(self):
-        # self.lm_head.submodule.weight = torch.stack([self.backbone.embedding.weight,])
         self.lm_head.tie_weights(self.backbone.embedding.weight)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):

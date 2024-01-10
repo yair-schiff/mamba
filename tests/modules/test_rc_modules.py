@@ -8,10 +8,12 @@ import pytest
 import torch
 from torch import nn
 
+from mamba.mamba_ssm.models.mixer_seq_simple import create_block
 from mamba.mamba_ssm.modules.mamba_simple import Mamba
 from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock
 from mamba.mamba_ssm.modules.rc_wrapper import (
-    RCPSEmbedding, RCPSWrapper, RCPSWrapperKeepDim, RCPSAddNormWrapper, RCPSAddNormWrapperKeepDim
+    RCPSEmbedding, RCPSWrapper, RCPSWrapperKeepDim, RCPSAddNormWrapper, RCPSAddNormWrapperKeepDim,
+    RCPSMambaBlockWrapper, RCPSMambaBlockWrapperKeepDims
 )
 
 try:
@@ -120,6 +122,111 @@ def test_rcps_wrapper_keep_dim(batch_size, seq_len, d_model, dtype):
     assert tuple(out.size()) == (batch_size, seq_len, d_model)
     assert tuple(rc_out.size()) == (batch_size, seq_len, d_model)
     assert torch.allclose(out.detach(), rc_out.detach(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len", [1024])
+@pytest.mark.parametrize("d_model", [128])
+@pytest.mark.parametrize("bidirectional", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_rcps_mamba_block_wrapper(batch_size, seq_len, d_model, bidirectional, dtype):
+    # Set tolerance
+    device = torch.device("cuda")
+    rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
+    if dtype == torch.bfloat16:
+        rtol, atol = 3e-2, 5e-2
+    # Set seed
+    torch.random.manual_seed(0)
+
+    # Generate random sequence
+    x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
+    rc_x = torch.flip(x, dims=[-2, -1])
+
+    ssm_cfg = {
+        "d_state": 16, "d_conv": 4, "expand": 2, "dt_rank": "auto", "dt_min": 0.001, "dt_max": 0.1, "dt_init": "random",
+        "dt_scale": 1.0, "dt_init_floor": 1e-4, "conv_bias": True, "bias": False, "use_fast_path": True
+    }
+    factory_kwargs = {"device": device, "dtype": dtype}
+
+    mamba_block = RCPSMambaBlockWrapper(
+        submodule=create_block(
+            d_model,
+            ssm_cfg=ssm_cfg,
+            norm_epsilon=1e-5,
+            rms_norm=True,
+            residual_in_fp32=True,
+            fused_add_norm=True,
+            layer_idx=0,
+            bidirectional=bidirectional,
+            bidirectional_strategy="add",
+            **factory_kwargs,
+        )
+    )
+
+    # Test RC equivariance of wrapper
+    out = mamba_block(x, residual=None)
+    rc_out = tuple([torch.flip(r, dims=[-2, -1]) for r in mamba_block(rc_x, residual=None)])
+    for f, r in zip(out, rc_out):
+        assert tuple(f.size()) == (batch_size, seq_len, d_model * 2)
+        assert tuple(r.size()) == (batch_size, seq_len, d_model * 2)
+        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+
+    out = mamba_block(x, residual=x)
+    rc_out = tuple([torch.flip(r, dims=[-2, -1]) for r in mamba_block(rc_x, residual=rc_x)])
+    for f, r in zip(out, rc_out):
+        assert tuple(f.size()) == (batch_size, seq_len, d_model * 2)
+        assert tuple(r.size()) == (batch_size, seq_len, d_model * 2)
+        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("seq_len", [1024])
+@pytest.mark.parametrize("d_model", [128])
+@pytest.mark.parametrize("bidirectional", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_rcps_mamba_block_wrapper_keep_dims(batch_size, seq_len, d_model, bidirectional, dtype):
+    # Set tolerance
+    device = torch.device("cuda")
+    rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
+    if dtype == torch.bfloat16:
+        rtol, atol = 3e-2, 5e-2
+    # Set seed
+    torch.random.manual_seed(0)
+
+    # Generate random sequence
+    x = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype)
+    rc_x = torch.flip(x, dims=[-2, -1])
+
+    ssm_cfg = {
+        "d_state": 16, "d_conv": 4, "expand": 2, "dt_rank": "auto", "dt_min": 0.001, "dt_max": 0.1, "dt_init": "random",
+        "dt_scale": 1.0, "dt_init_floor": 1e-4, "conv_bias": True, "bias": False, "use_fast_path": True
+    }
+    factory_kwargs = {"device": device, "dtype": dtype}
+
+    mamba_block = RCPSMambaBlockWrapperKeepDims(
+        submodule=create_block(
+            d_model,
+            ssm_cfg=ssm_cfg,
+            norm_epsilon=1e-5,
+            rms_norm=True,
+            residual_in_fp32=True,
+            fused_add_norm=True,
+            layer_idx=0,
+            bidirectional=bidirectional,
+            bidirectional_strategy="add",
+            **factory_kwargs,
+        ),
+        dim=d_model,
+        **factory_kwargs,
+    )
+
+    # Test RC equivariance of wrapper
+    out = mamba_block(x, residual=None)
+    rc_out = tuple([torch.flip(r, dims=[-2, -1]) for r in mamba_block(rc_x, residual=None)])
+    for f, r in zip(out, rc_out):
+        assert tuple(f.size()) == (batch_size, seq_len, d_model)
+        assert tuple(r.size()) == (batch_size, seq_len, d_model)
+        assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [2])
