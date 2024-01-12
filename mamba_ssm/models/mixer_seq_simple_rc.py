@@ -16,7 +16,7 @@ from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 from mamba.mamba_ssm.models.mixer_seq_simple import create_block
 from mamba.mamba_ssm.modules.rc_wrapper import (
-    RCPSEmbedding, RCPSWrapper, RCPSWrapperKeepDim, RCPSMambaBlockWrapperKeepDims, RCPSAddNormWrapper, RCPSLMHead
+    RCPSEmbedding, RCPSWrapper, RCPSMambaBlockWrapper, RCPSAddNormWrapper, RCPSLMHead
 )
 
 try:
@@ -33,8 +33,10 @@ def _init_weights(
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
-    if isinstance(module, (RCPSWrapper, RCPSWrapperKeepDim, RCPSMambaBlockWrapperKeepDims)):
+    if isinstance(module, (RCPSWrapper, RCPSMambaBlockWrapper)):
         module = module.submodule
+    if isinstance(module, RCPSLMHead):
+        module = module.lm_head
     if isinstance(module, nn.Linear):
         if module.bias is not None:
             if not getattr(module.bias, "_no_reinit", False):
@@ -84,15 +86,13 @@ class RCPSMixerModel(nn.Module):
 
         self.embedding = RCPSEmbedding(vocab_size, d_model, complement_map, **factory_kwargs)
 
-        # We keep the order of residual and layer norm to be consistent with the base MixerModel clas:
         # Instead of LN -> Attn / MLP -> Add, we do:
         # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
         # the main branch (output of MLP / Mixer). The model definition is unchanged.
         # This was originally done for performance reason, i.e. fuse add + layer_norm.
-        # However, we cannot use fused add norm because we need to control residual connection in RCPS manner.
 
         self.layers = nn.ModuleList([
-            RCPSMambaBlockWrapperKeepDims(
+            RCPSMambaBlockWrapper(
                 submodule=create_block(
                     d_model,
                     ssm_cfg=ssm_cfg,
@@ -105,19 +105,19 @@ class RCPSMixerModel(nn.Module):
                     bidirectional_strategy=bidirectional_strategy,
                     **factory_kwargs,
                 ),
-                dim=d_model,
-                **factory_kwargs)
+            )
             for i in range(n_layer)
         ])
 
-        if fused_add_norm:
-            print("WARNING: `fused_add_norm` is not supported in RCPSMixerModel. Defaulting to `False`.")
-            fused_add_norm = False
         self.fused_add_norm = fused_add_norm
+        if self.fused_add_norm:
+            if layer_norm_fn is None or rms_norm_fn is None:
+                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
 
-        norm_cls = nn.LayerNorm if not rms_norm else RMSNorm
-        self.norm_f = RCPSAddNormWrapper(norm_cls(d_model, eps=norm_epsilon, **factory_kwargs))
-
+        norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
+            d_model, eps=norm_epsilon, **factory_kwargs
+        )
+        self.norm_f = norm_f if fused_add_norm else RCPSAddNormWrapper(norm_f)
         self.apply(
             partial(
                 _init_weights,
@@ -139,8 +139,30 @@ class RCPSMixerModel(nn.Module):
             hidden_states, residual = layer(
                 hidden_states, residual=residual, inference_params=inference_params
             )
-        # RCPS add & norm; output of this final step will double the number of channels
-        hidden_states, _ = self.norm_f(hidden_states, residual)
+        if not self.fused_add_norm:
+            hidden_states, _ = self.norm_f(hidden_states, residual=residual)
+        else:
+            # Set prenorm=False here since we don't need the residual
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
+            hidden_states_fwd = fused_add_norm_fn(
+                hidden_states[..., :hidden_states.shape[-1] // 2],
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual[..., :hidden_states.shape[-1] // 2],
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+            )
+            hidden_states_rc = fused_add_norm_fn(
+                hidden_states[..., hidden_states.shape[-1] // 2:].flip(dims=[-2, -1]),
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual[..., hidden_states.shape[-1] // 2:].flip(dims=[-2, -1]),
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+            )
+            hidden_states = torch.cat([hidden_states_fwd, hidden_states_rc.flip(dims=[-2, -1])], dim=-1)
         return hidden_states
 
 
