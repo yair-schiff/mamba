@@ -110,13 +110,12 @@ class MambaWrapper(nn.Module):
             d_model=d_model,
             **mamba_kwargs
         )
-        if bidirectional:
-            self.mamba_rev = Mamba(
-                d_model=d_model,
-                **mamba_kwargs
-            )
-        else:
-            self.mamba_rev = None
+        # Todo: this second model is not used when bidirectional is False, but logging errors occur when it is made optional.
+        # Another solution could be using a single model for forward and reverse and include a direction token.
+        self.mamba_rev = Mamba(
+            d_model=d_model,
+            **mamba_kwargs
+        )
 
     def forward(self, hidden_states, inference_params=None):
         """Bidirectional-enabled forward pass
