@@ -15,3 +15,4 @@ class MambaConfig:
     pad_vocab_size_multiple: int = 8
     bidirectional: bool = False
     bidirectional_strategy: Union[str, None] = None
+    bidirectional_weight_tie: bool = False

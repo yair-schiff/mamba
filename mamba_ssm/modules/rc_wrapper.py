@@ -68,7 +68,10 @@ class RCPSWrapper(nn.Module):
     def forward(self, x, **kwargs):
         """Reverse-complement equivariant forward pass.
 
-        x: Input tensor of shape (batch_size, seq_len, channels)
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, channels)
+        Returns:
+            Output tensor of shape (batch_size, seq_len, channels * 2)
         """
         n_channels = x.shape[-1]
         # Run submodule along sequence
@@ -79,17 +82,11 @@ class RCPSWrapper(nn.Module):
         return torch.cat([fwd_out, self.rc(rc_out)], dim=-1)
 
 
-class RCPSMambaBlockWrapper(nn.Module):
+class RCPSMambaBlockWrapper(RCPSWrapper):
     """Wrapper around MambaBlocks.
     """
     def __init__(self, submodule: nn.Module):
-        super().__init__()
-        self.submodule = submodule
-
-    @staticmethod
-    def rc(x):
-        """Reverse-complement a tensor by flipping the length (dim=-2) and channel (dim=-1) dimensions."""
-        return torch.flip(x, dims=[-2, -1])
+        super().__init__(submodule)
 
     def forward(self, x, residual=None, **kwargs):
         """Reverse-complement equivariant forward pass that maintains output dimensionality by projecting down
@@ -120,22 +117,16 @@ class RCPSMambaBlockWrapper(nn.Module):
         )
         rc_hidden, rc_residual = rc_out[0], rc_out[1]
 
+        # Concatenate along channel dimension (dim=-1)
         hidden = torch.cat([fwd_hidden, self.rc(rc_hidden)], dim=-1)
         residual = torch.cat([fwd_residual, self.rc(rc_residual)], dim=-1)
-        # Concatenate along channel dimension (dim=-1)
         return hidden, residual
 
 
-class RCPSAddNormWrapper(nn.Module):
+class RCPSAddNormWrapper(RCPSWrapper):
     """RC equivariant AddNorm layer."""
-    def __init__(self, norm_f: nn.Module):
-        super().__init__()
-        self.norm_f = norm_f
-
-    @staticmethod
-    def rc(x):
-        """Reverse-complement a tensor by flipping the length (dim=-2) and channel (dim=-1) dimensions."""
-        return torch.flip(x, dims=[-2, -1])
+    def __init__(self, submodule: nn.Module):
+        super().__init__(submodule)
 
     def forward(self, x, residual=None):
         """
@@ -146,15 +137,15 @@ class RCPSAddNormWrapper(nn.Module):
         n_channels = x.shape[-1]
         if residual is None:
             residual = x
-            x_fwd = self.norm_f(x[..., :n_channels // 2].to(dtype=self.norm_f.weight.dtype))
-            x_rc = self.norm_f(self.rc(x[..., n_channels // 2:]).to(dtype=self.norm_f.weight.dtype))
+            x_fwd = self.submodule(x[..., :n_channels // 2].to(dtype=self.submodule.weight.dtype))
+            x_rc = self.submodule(self.rc(x[..., n_channels // 2:]).to(dtype=self.submodule.weight.dtype))
             x = torch.cat([x_fwd, self.rc(x_rc)], dim=-1)
         else:
             residual_fwd = x[..., :n_channels // 2] + residual[..., :n_channels // 2]
-            x_fwd = self.norm_f(residual_fwd.to(dtype=self.norm_f.weight.dtype))
+            x_fwd = self.submodule(residual_fwd.to(dtype=self.submodule.weight.dtype))
 
             residual_rc = self.rc(x[..., n_channels // 2:]) + self.rc(residual[..., n_channels // 2:])
-            x_rc = self.norm_f(residual_rc.to(dtype=self.norm_f.weight.dtype))
+            x_rc = self.submodule(residual_rc.to(dtype=self.submodule.weight.dtype))
 
             residual = torch.cat([residual_fwd, self.rc(residual_rc)], dim=-1)
             x = torch.cat([x_fwd, self.rc(x_rc)], dim=-1)
@@ -164,12 +155,16 @@ class RCPSAddNormWrapper(nn.Module):
 
 class RCPSLMHead(nn.Module):
     """LM Head for reverse-complement equivariant inputs, which have dim * 2 relative to standard inputs."""
-    def __init__(self, true_dim: int, vocab_size: int, **factory_kwargs):
+    def __init__(self, true_dim: int, vocab_size: int, complement_map: dict, **factory_kwargs):
         """
         `true_dim` corresponds to the actual dimensionality of the input were it not reverse-complement
         equivariant, i.e. 0.5 times the actual input dim.
         """
         super().__init__()
+        self.register_buffer(
+            "complement_map",
+            torch.tensor(list(OrderedDict(complement_map).values()), dtype=torch.long)
+        )
         self.true_dim = true_dim
         self.lm_head = nn.Linear(true_dim, vocab_size, bias=False, **factory_kwargs)
 
@@ -190,8 +185,12 @@ class RCPSLMHead(nn.Module):
         n_channels = x.shape[-1]
         assert n_channels == 2 * self.true_dim, "Input must have 2 * true_dim channels."
         fwd_logits = F.linear(x[..., :n_channels // 2], self.weight, bias=self.lm_head.bias)
-        rc_logits = F.linear(torch.flip(x[..., n_channels // 2:], dims=[-1]), self.weight, bias=self.lm_head.bias)
-        return fwd_logits + torch.flip(rc_logits, dims=[-1])
+        rc_logits = F.linear(
+            torch.flip(x[..., n_channels // 2:], dims=[-1]),
+            self.weight[self.complement_map, :],
+            bias=self.lm_head.bias
+        )
+        return fwd_logits + rc_logits
 
 
 class RCPSCollapse(nn.Module):

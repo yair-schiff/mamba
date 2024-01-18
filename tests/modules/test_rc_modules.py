@@ -10,7 +10,7 @@ from torch import nn
 
 from mamba.mamba_ssm.models.mixer_seq_simple import create_block
 from mamba.mamba_ssm.modules.mamba_simple import Mamba
-from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock
+from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock, RCBlockTest, RCMamba
 from mamba.mamba_ssm.modules.rc_wrapper import RCPSEmbedding, RCPSWrapper, RCPSAddNormWrapper, RCPSMambaBlockWrapper
 
 try:
@@ -33,17 +33,32 @@ def test_rcps_embedding(batch_size, seq_len, d_model, dtype):
     torch.random.manual_seed(0)
 
     # Define complement map
-    str_to_id = {"A": 0, "C": 1, "G": 2, "T": 3}
+    str_to_id = {"[CLS]": 0, "[MASK]": 1, "A": 2, "C": 3, "G": 4, "T": 5, "N": 6}
     complement_map = {"A": "T", "C": "G", "G": "C", "T": "A"}
-    complement_map = {str_to_id[k]: str_to_id[v] for k, v in complement_map.items()}
+    complement_map = {
+        str_to_id[k]: str_to_id[complement_map[k]] if k in complement_map.keys() else v
+        for k, v in str_to_id.items()
+    }
+    vocab_size = 12
+    pad_vocab_size_multiple = 8
+    if vocab_size % pad_vocab_size_multiple != 0:
+        vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+    if vocab_size > len(complement_map):
+        for i in range(len(complement_map), vocab_size):
+            complement_map[i] = i
 
     # Generate random sequences
-    input_ids = torch.randint(low=0, high=4, size=(batch_size, seq_len), device=device)
+    input_ids = torch.randint(low=1, high=len(str_to_id), size=(batch_size, seq_len), device=device)
     rc_input_ids = torch.flip(input_ids, dims=[-1]).to("cpu").apply_(lambda t: complement_map[t]).to(device)
 
     # Test RC equivariance of embedding layer
     factory_kwargs = {"device": device, "dtype": dtype}
-    embedding = RCPSEmbedding(vocab_size=4, d_model=d_model, complement_map=complement_map, **factory_kwargs).to(device)
+    embedding = RCPSEmbedding(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        complement_map=complement_map,
+        **factory_kwargs
+    ).to(device)
     out_embed = embedding(input_ids)
     rc_out_embed = torch.flip(embedding(rc_input_ids), dims=[-2, -1])
     # Test that channels are 2 * d_model

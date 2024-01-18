@@ -11,8 +11,9 @@ from collections import namedtuple
 import torch
 import torch.nn as nn
 
+from mamba.mamba_ssm.modules.bidirectional_mamba_simple import BidirectionalMamba
 from mamba_ssm.models.config_mamba import MambaConfig
-from mamba_ssm.modules.mamba_simple import Mamba, Block
+from mamba_ssm.modules.mamba_simple import Block, Mamba
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
@@ -32,19 +33,23 @@ def create_block(
     layer_idx=None,
     bidirectional=False,
     bidirectional_strategy=None,
-    bidirectional_weight_tie=False,
     device=None,
     dtype=None,
 ):
     if ssm_cfg is None:
         ssm_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
-    bidirectional_kwargs = {
-        "bidirectional": bidirectional,
-        "bidirectional_strategy": bidirectional_strategy,
-        "bidirectional_weight_tie": bidirectional_weight_tie,
-    }
-    mixer_cls = partial(MambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
+
+    if bidirectional:
+        mixer_cls = partial(
+            BidirectionalMamba,
+            bidirectional_strategy=bidirectional_strategy,
+            layer_idx=layer_idx,
+            **ssm_cfg,
+            **factory_kwargs
+        )
+    else:
+        mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -92,59 +97,6 @@ def _init_weights(
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
-class MambaWrapper(nn.Module):
-    """Thin wrapper around Mamba to support bi-directionality."""
-    def __init__(
-        self,
-        d_model: int,
-        bidirectional: bool = False,
-        bidirectional_strategy: Optional[str] = None,
-        bidirectional_weight_tie: bool = False,
-        **mamba_kwargs,
-    ):
-        super().__init__()
-        if bidirectional and bidirectional_strategy is None:
-            bidirectional_strategy = "add"  # Default strategy: `add`
-        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply"]:
-            raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
-        self.bidirectional = bidirectional
-        self.bidirectional_strategy = bidirectional_strategy
-        self.mamba_fwd = Mamba(
-            d_model=d_model,
-            **mamba_kwargs
-        )
-        if bidirectional:
-            self.mamba_rev = Mamba(
-                d_model=d_model,
-                **mamba_kwargs
-            )
-            if bidirectional_weight_tie:  # Tie in and out projections (where most of param count lies)
-                self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
-                self.mamba_rev.in_proj.bias = self.mamba_fwd.in_proj.bias
-                self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
-                self.mamba_rev.out_proj.bias = self.mamba_fwd.out_proj.bias
-        else:
-            self.mamba_rev = None
-
-    def forward(self, hidden_states, inference_params=None):
-        """Bidirectional-enabled forward pass
-
-        hidden_states: (B, L, D)
-        Returns: same shape as hidden_states
-        """
-        out = self.mamba_fwd(hidden_states, inference_params=inference_params)
-        if self.bidirectional:
-            out_rev = self.mamba_rev(
-                hidden_states.flip(dims=(1,)),  # Flip along the sequence length dimension
-                inference_params=inference_params
-            ).flip(dims=(1,))  # Flip back for combining with forward hidden states
-            if self.bidirectional_strategy == "add":
-                out = out + out_rev
-            elif self.bidirectional_strategy == "ew_multiply":
-                out = out * out_rev
-        return out
-
-
 class MixerModel(nn.Module):
     def __init__(
         self,
@@ -159,7 +111,6 @@ class MixerModel(nn.Module):
         residual_in_fp32=False,
         bidirectional: bool = False,
         bidirectional_strategy: Optional[str] = None,
-        bidirectional_weight_tie: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -191,7 +142,6 @@ class MixerModel(nn.Module):
                     layer_idx=i,
                     bidirectional=bidirectional,
                     bidirectional_strategy=bidirectional_strategy,
-                    bidirectional_weight_tie=bidirectional_weight_tie,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -261,7 +211,6 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         pad_vocab_size_multiple = config.pad_vocab_size_multiple
         bidirectional = config.bidirectional
         bidirectional_strategy = config.bidirectional_strategy
-        bidirectional_weight_tie = config.bidirectional_weight_tie
         factory_kwargs = {"device": device, "dtype": dtype}
 
         super().__init__()
@@ -278,7 +227,6 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             residual_in_fp32=residual_in_fp32,
             bidirectional=bidirectional,
             bidirectional_strategy=bidirectional_strategy,
-            bidirectional_weight_tie=bidirectional_weight_tie,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
