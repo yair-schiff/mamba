@@ -16,3 +16,4 @@ class MambaConfig:
     bidirectional: bool = False
     bidirectional_strategy: Union[str, None] = None
     use_fast_path: bool = True
+    use_pos_emb: bool = False

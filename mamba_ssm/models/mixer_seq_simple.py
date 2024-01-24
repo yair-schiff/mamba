@@ -15,7 +15,7 @@ from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba, Block
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
-
+from mamba_ssm.utils.rope import RotaryEmbedding, apply_rotary_pos_emb
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
@@ -34,6 +34,7 @@ def create_block(
     bidirectional_strategy=None,
     device=None,
     dtype=None,
+    use_fast_path=True, 
 ):
     if ssm_cfg is None:
         ssm_cfg = {}
@@ -42,7 +43,8 @@ def create_block(
         "bidirectional": bidirectional,
         "bidirectional_strategy": bidirectional_strategy,
     }
-    mixer_cls = partial(MambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
+    mixer_cls = partial(MambaWrapper, layer_idx=layer_idx, use_fast_path=use_fast_path, **ssm_cfg,**bidirectional_kwargs, **factory_kwargs)
+    
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -102,7 +104,7 @@ class MambaWrapper(nn.Module):
         super().__init__()
         if bidirectional and bidirectional_strategy is None:
             bidirectional_strategy = "add"  # Default strategy: `add`
-        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply"]:
+        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply","concatenate"]:
             raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
@@ -116,23 +118,29 @@ class MambaWrapper(nn.Module):
             d_model=d_model,
             **mamba_kwargs
         )
-
-    def forward(self, hidden_states, inference_params=None):
+        if self.bidirectional_strategy == "concatenate":
+            self.downsample = nn.Linear(2*d_model, d_model, bias=False)
+  
+    def forward(self, hidden_states, mask=None, inference_params=None):
         """Bidirectional-enabled forward pass
 
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
-        out = self.mamba_fwd(hidden_states, inference_params=inference_params)
+        out = self.mamba_fwd(hidden_states, mask=mask, inference_params=inference_params)
         if self.bidirectional:
             out_rev = self.mamba_rev(
                 hidden_states.flip(dims=(1,)),  # Flip along the sequence length dimension
+                mask = mask.flip(dims=(1,)),  # Flip along the sequence length dimension
                 inference_params=inference_params
             ).flip(dims=(1,))  # Flip back for combining with forward hidden states
             if self.bidirectional_strategy == "add":
                 out = out + out_rev
             elif self.bidirectional_strategy == "ew_multiply":
                 out = out * out_rev
+            elif self.bidirectional_strategy == "concatenate":
+                out = torch.concatenate([out,out_rev],dim=-1)
+                out = self.downsample(out)
         return out
 
 
@@ -152,13 +160,16 @@ class MixerModel(nn.Module):
         bidirectional_strategy: Optional[str] = None,
         device=None,
         dtype=None,
+        use_fast_path=True,
+        use_pos_emb=False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
-
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
-
+        self.use_pos_emb = use_pos_emb
+        if self.use_pos_emb:
+            self.pos_embedding = RotaryEmbedding(d_model)
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
         # Add -> LN -> Attn / MLP / Mixer, returning both the residual branch (output of Add) and
@@ -181,6 +192,7 @@ class MixerModel(nn.Module):
                     layer_idx=i,
                     bidirectional=bidirectional,
                     bidirectional_strategy=bidirectional_strategy,
+                    use_fast_path = use_fast_path,
                     **factory_kwargs,
                 )
                 for i in range(n_layer)
@@ -205,12 +217,16 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, inference_params=None):
+    def forward(self, input_ids, mask=None, inference_params=None):
         hidden_states = self.embedding(input_ids)
+        # add rotary positional embedding
+        if self.use_pos_emb:
+            pos_emb = self.pos_embedding(input_ids.shape[1],device=input_ids.device)
+            hidden_states = apply_rotary_pos_emb(hidden_states,pos_emb)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(
-                hidden_states, residual, inference_params=inference_params
+                hidden_states, residual, mask=mask, inference_params=inference_params
             )
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -266,6 +282,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
             residual_in_fp32=residual_in_fp32,
             bidirectional=bidirectional,
             bidirectional_strategy=bidirectional_strategy,
+            use_fast_path=config.use_fast_path,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False, **factory_kwargs)
@@ -286,12 +303,12 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, inference_params=None, num_last_tokens=0):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, inference_params=None, num_last_tokens=0):
         """
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, inference_params=inference_params)
+        hidden_states = self.backbone(input_ids, mask=attention_mask, inference_params=inference_params)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
@@ -301,8 +318,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):
         config_data = load_config_hf(pretrained_model_name)
-        config = MambaConfig(**config_data)
-        model = cls(config, device=device, dtype=dtype, **kwargs)
+        config = MambaConfig(**config_data, **kwargs)
+        model = cls(config, device=device, dtype=dtype)
         model.load_state_dict(load_state_dict_hf(pretrained_model_name, device=device, dtype=dtype))
         return model
 
