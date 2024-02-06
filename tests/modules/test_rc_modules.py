@@ -7,11 +7,14 @@ from functools import partial
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from mamba.mamba_ssm.models.mixer_seq_simple import create_block
 from mamba.mamba_ssm.modules.mamba_simple import Mamba
-from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock, RCBlockTest, RCMamba
-from mamba.mamba_ssm.modules.rc_wrapper import RCPSEmbedding, RCPSWrapper, RCPSAddNormWrapper, RCPSMambaBlockWrapper
+from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock
+from mamba.mamba_ssm.modules.rc_wrapper import (
+    RCPSEmbedding, RCPSWrapper, RCPSAddNormWrapper, RCPSMambaBlockWrapper, RCPSLMHead
+)
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -234,3 +237,62 @@ def test_rcps_block(batch_size, seq_len, d_model, dtype, rms_norm, fused_add_nor
         assert f.size() == x.size()
         assert r.size() == x.size()
         assert torch.allclose(f.detach(), r.detach(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("seq_len", [1, 1024, 2048])
+@pytest.mark.parametrize("d_model", [2, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_rcps_lm_head(batch_size, seq_len, d_model, dtype):
+    # Set tolerance
+    device = torch.device("cuda")
+    rtol, atol = (6e-4, 2e-3) if dtype == torch.float32 else (3e-3, 5e-3)
+    if dtype == torch.bfloat16:
+        rtol, atol = 3e-2, 5e-2
+
+    # Set seed
+    torch.random.manual_seed(0)
+
+    # Define complement map
+    str_to_id = {"[CLS]": 0, "[MASK]": 1, "A": 2, "C": 3, "G": 4, "T": 5, "N": 6}
+    complement_map = {"A": "T", "C": "G", "G": "C", "T": "A"}
+    complement_map = {
+        str_to_id[k]: str_to_id[complement_map[k]] if k in complement_map.keys() else v
+        for k, v in str_to_id.items()
+    }
+    factory_kwargs = {"device": device, "dtype": dtype}
+    vocab_size = 12
+    if vocab_size > len(complement_map):
+        for i in range(len(complement_map), vocab_size):
+            complement_map[i] = i
+
+    # Instantiate LM head
+    lm_head = RCPSLMHead(
+        complement_map=complement_map,
+        vocab_size=vocab_size,
+        true_dim=d_model,
+        **factory_kwargs
+    )
+    lm_head.tie_weights(torch.nn.Parameter(torch.eye(2, dtype=dtype, device=device)))
+
+    # Generate random sequence with 2 * d_model channels
+    x = torch.randn(batch_size, seq_len, d_model * 2, device=device, dtype=dtype)
+    rc_x = torch.flip(x, dims=[-2, -1])
+
+    # Test RC equivariance of LM head
+    out = lm_head(x)
+    rc_out = lm_head(rc_x)
+    assert tuple(out.size()) == (batch_size, seq_len, vocab_size)
+    assert tuple(rc_out.size()) == (batch_size, seq_len, vocab_size)
+    assert torch.allclose(
+        out.detach(),
+        torch.flip(rc_out.detach()[..., lm_head.complement_map], dims=[1]),
+        rtol=rtol,
+        atol=atol
+    )
+    assert torch.allclose(
+        F.softmax(out, dim=-1).detach(),
+        torch.flip(F.softmax(rc_out, dim=-1).detach()[..., lm_head.complement_map], dims=[1]),
+        rtol=rtol,
+        atol=atol
+    )
