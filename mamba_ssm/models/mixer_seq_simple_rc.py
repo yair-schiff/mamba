@@ -14,9 +14,8 @@ import torch.nn as nn
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
-# from mamba.mamba_ssm.models.mixer_seq_simple import create_block
 from mamba.mamba_ssm.models.mixer_seq_simple import MambaWrapper
-from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock, RCBlockTest, RCMamba
+from mamba.mamba_ssm.modules.mamba_simple_rc import RCBlock
 from mamba.mamba_ssm.modules.rc_wrapper import (
     RCPSEmbedding, RCPSWrapper, RCPSMambaBlockWrapper, RCPSAddNormWrapper, RCPSLMHead
 )
@@ -50,11 +49,10 @@ def create_rcps_block(
         "bidirectional_weight_tie": bidirectional_weight_tie,
     }
     mixer_cls = partial(MambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
-    # mixer_cls = partial(RCMambaWrapper, layer_idx=layer_idx, **ssm_cfg, **bidirectional_kwargs, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
-    block = RCBlock(  # Block(
+    block = RCBlock(
         d_model,
         mixer_cls,
         norm_cls=norm_cls,
@@ -103,60 +101,6 @@ def _init_weights(
                     p /= math.sqrt(n_residuals_per_layer * n_layer)
 
 
-
-class RCMambaWrapper(nn.Module):
-    """Thin wrapper around Mamba to support bi-directionality."""
-    def __init__(
-        self,
-        d_model: int,
-        bidirectional: bool = False,
-        bidirectional_strategy: Optional[str] = None,
-        bidirectional_weight_tie: bool = False,
-        **mamba_kwargs,
-    ):
-        super().__init__()
-        if bidirectional and bidirectional_strategy is None:
-            bidirectional_strategy = "add"  # Default strategy: `add`
-        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply"]:
-            raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
-        self.bidirectional = bidirectional
-        self.bidirectional_strategy = bidirectional_strategy
-        self.mamba_fwd = RCMamba(
-            d_model=d_model,
-            **mamba_kwargs
-        )
-        if bidirectional:
-            self.mamba_rev = RCMamba(
-                d_model=d_model,
-                **mamba_kwargs
-            )
-            if bidirectional_weight_tie:  # Tie in and out projections (where most of param count lies)
-                self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
-                self.mamba_rev.in_proj.bias = self.mamba_fwd.in_proj.bias
-                self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
-                self.mamba_rev.out_proj.bias = self.mamba_fwd.out_proj.bias
-        else:
-            self.mamba_rev = None
-
-    def forward(self, hidden_states, inference_params=None):
-        """Bidirectional-enabled forward pass
-
-        hidden_states: (B, L, D)
-        Returns: same shape as hidden_states
-        """
-        out = self.mamba_fwd(hidden_states, inference_params=inference_params)
-        if self.bidirectional:
-            out_rev = self.mamba_rev(
-                hidden_states.flip(dims=(1,)),  # Flip along the sequence length dimension
-                inference_params=inference_params
-            ).flip(dims=(1,))  # Flip back for combining with forward hidden states
-            if self.bidirectional_strategy == "add":
-                out = out + out_rev
-            elif self.bidirectional_strategy == "ew_multiply":
-                out = out * out_rev
-        return out
-
-
 class RCPSMixerModel(nn.Module):
     def __init__(
         self,
@@ -188,21 +132,6 @@ class RCPSMixerModel(nn.Module):
         # This was originally done for performance reason, i.e. fuse add + layer_norm.
 
         self.layers = nn.ModuleList([
-            # RCPSMambaBlockWrapper(
-            #     submodule=create_block(
-            #         d_model,
-            #         ssm_cfg=ssm_cfg,
-            #         norm_epsilon=norm_epsilon,
-            #         rms_norm=rms_norm,
-            #         residual_in_fp32=residual_in_fp32,
-            #         fused_add_norm=fused_add_norm,
-            #         layer_idx=i,
-            #         bidirectional=bidirectional,
-            #         bidirectional_strategy=bidirectional_strategy,
-            #         bidirectional_weight_tie=bidirectional_weight_tie,
-            #         **factory_kwargs,
-            #     ),
-            # )
             create_rcps_block(
                 d_model,
                 ssm_cfg=ssm_cfg,
