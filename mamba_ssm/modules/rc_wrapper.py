@@ -22,7 +22,6 @@ class RCPSEmbedding(nn.Module):
             "complement_map",
             torch.tensor(list(OrderedDict(complement_map).values()), dtype=torch.long)
         )
-        self.vmap_complement = torch.vmap(lambda t: self.complement_map[t])
         self.embedding = nn.Embedding(vocab_size, d_model, **factory_kwargs)
 
     @property
@@ -32,7 +31,12 @@ class RCPSEmbedding(nn.Module):
 
     def rc(self, x):
         """Reverse-complement a tensor of input_ids by flipping along length dimension and complementing the ids."""
-        return self.vmap_complement(torch.flip(x, dims=[-1]))
+        # return self.vmap_complement(torch.flip(x, dims=[-1]))
+        return torch.gather(
+            self.complement_map.unsqueeze(0).expand(x.shape[0], -1),
+            dim=1,
+            index=torch.flip(x, dims=[-1])
+        )
 
     def forward(self, input_ids):
         """Reverse-complement equivariant forward pass.

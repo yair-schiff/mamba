@@ -273,7 +273,6 @@ def test_rcps_lm_head(batch_size, seq_len, d_model, dtype):
         true_dim=d_model,
         **factory_kwargs
     )
-    lm_head.tie_weights(torch.nn.Parameter(torch.eye(2, dtype=dtype, device=device)))
 
     # Generate random sequence with 2 * d_model channels
     x = torch.randn(batch_size, seq_len, d_model * 2, device=device, dtype=dtype)
