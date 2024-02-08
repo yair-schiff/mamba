@@ -134,9 +134,7 @@ class MambaWrapper(nn.Module):
                 hidden_states.flip(dims=(1,)),  # Flip along the sequence length dimension
                 mask = mask.flip(dims=(1,)) if mask is not None else None,  # Flip along the sequence length dimension
                 inference_params=inference_params
-            ).flip(dims=(1,))  # Flip back for combining with forward hidden states
-        
-            
+            ).flip(dims=(1,))  # Flip back for combining with forward hidden states  
             if self.bidirectional_strategy == "add":
                 out = out + out_rev
             elif self.bidirectional_strategy == "ew_multiply":
