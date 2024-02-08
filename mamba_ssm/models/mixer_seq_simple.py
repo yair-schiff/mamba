@@ -112,6 +112,7 @@ class MambaWrapper(nn.Module):
             d_model=d_model,
             **mamba_kwargs
         )
+     
         # Todo: this second model is not used when bidirectional is False, but logging errors occur when it is made optional.
         # Another solution could be using a single model for forward and reverse and include a direction token.
         self.mamba_rev = Mamba(
@@ -120,7 +121,7 @@ class MambaWrapper(nn.Module):
         )
         if self.bidirectional_strategy == "concatenate":
             self.downsample = nn.Linear(2*d_model, d_model, bias=False)
-  
+        
     def forward(self, hidden_states, mask=None, inference_params=None):
         """Bidirectional-enabled forward pass
 
@@ -131,9 +132,11 @@ class MambaWrapper(nn.Module):
         if self.bidirectional:
             out_rev = self.mamba_rev(
                 hidden_states.flip(dims=(1,)),  # Flip along the sequence length dimension
-                mask = mask.flip(dims=(1,)),  # Flip along the sequence length dimension
+                mask = mask.flip(dims=(1,)) if mask is not None else None,  # Flip along the sequence length dimension
                 inference_params=inference_params
             ).flip(dims=(1,))  # Flip back for combining with forward hidden states
+        
+            
             if self.bidirectional_strategy == "add":
                 out = out + out_rev
             elif self.bidirectional_strategy == "ew_multiply":
@@ -198,7 +201,7 @@ class MixerModel(nn.Module):
                 for i in range(n_layer)
             ]
         )
-
+    
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
             d_model, eps=norm_epsilon, **factory_kwargs
         )
