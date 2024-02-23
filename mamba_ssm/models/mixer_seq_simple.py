@@ -104,7 +104,7 @@ class MambaWrapper(nn.Module):
         super().__init__()
         if bidirectional and bidirectional_strategy is None:
             bidirectional_strategy = "add"  # Default strategy: `add`
-        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply","concatenate"]:
+        if bidirectional and bidirectional_strategy not in ["add", "ew_multiply","concatenate", "bigs", "add_wt"]:
             raise NotImplementedError(f"`{bidirectional_strategy}` strategy for bi-directionality is not implemented!")
         self.bidirectional = bidirectional
         self.bidirectional_strategy = bidirectional_strategy
@@ -112,6 +112,7 @@ class MambaWrapper(nn.Module):
             d_model=d_model,
             **mamba_kwargs
         )
+        self.d_model = d_model
      
         # Todo: this second model is not used when bidirectional is False, but logging errors occur when it is made optional.
         # Another solution could be using a single model for forward and reverse and include a direction token.
@@ -121,7 +122,25 @@ class MambaWrapper(nn.Module):
         )
         if self.bidirectional_strategy == "concatenate":
             self.downsample = nn.Linear(2*d_model, d_model, bias=False)
-        
+
+        ## matching the architecture shown in BiGs
+        if self.bidirectional_strategy == "bigs":
+            print("==> using BIGs architecture") ## its good to have a sanity print statement
+            self.activation = nn.GELU()
+            self.residual_linear = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
+            self.mamba_linear = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
+            self.gated_linear = nn.Linear(3 * self.d_model, self.d_model, bias=True)
+
+        if self.bidirectional_strategy == "add_wt":
+            print("==> USING ADD WITH WEIGHT TYING") ## its good to have a sanity print statement
+            ## tie the weights of the conv input+output if it is add + weight tying
+            self.mamba_fwd.conv1d.weight = self.mamba_rev.conv1d.weight
+            self.mamba_fwd.conv1d.bias = self.mamba_rev.conv1d.bias
+            ## tying the out projection weights
+            self.mamba_fwd.out_proj.weight = self.mamba_rev.out_proj.weight
+            self.mamba_fwd.out_proj.bias = self.mamba_rev.out_proj.bias
+
+
     def forward(self, hidden_states, mask=None, inference_params=None):
         """Bidirectional-enabled forward pass
 
@@ -137,11 +156,22 @@ class MambaWrapper(nn.Module):
             ).flip(dims=(1,))  # Flip back for combining with forward hidden states  
             if self.bidirectional_strategy == "add":
                 out = out + out_rev
+            elif self.bidirectional_strategy == "add_wt":
+                out = out + out_rev
             elif self.bidirectional_strategy == "ew_multiply":
                 out = out * out_rev
             elif self.bidirectional_strategy == "concatenate":
                 out = torch.concatenate([out,out_rev],dim=-1)
                 out = self.downsample(out)
+            elif self.bidirectional_strategy == "bigs": ## following BiGs closely
+                ## pass the hidden states through the linear and then gate
+                gated_residual = self.activation(self.residual_linear(hidden_states))
+                combined = out * out_rev ## first element-wise multiply the two
+                gated_combined = self.activation(self.mamba_linear(combined))
+                gated_out = gated_residual * gated_combined
+                out = self.gated_linear(gated_out)
+                ## the residual connection is done at the "Block" level, and this is just replacing the mamba with a MambaWraper
+
         return out
 
 
@@ -218,17 +248,28 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, mask=None, inference_params=None):
+    def forward(self, input_ids, mask=None, inference_params=None, return_all_hidden=False):
+        batch_size, length = input_ids.shape
         hidden_states = self.embedding(input_ids)
         # add rotary positional embedding
         if self.use_pos_emb:
             pos_emb = self.pos_embedding(input_ids.shape[1],device=input_ids.device)
             hidden_states = apply_rotary_pos_emb(hidden_states,pos_emb)
         residual = None
-        for layer in self.layers:
+
+        if return_all_hidden: ## only saves it if part of the arguments wants to -- doing this to save space
+            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device=input_ids.device)
+        else:
+            all_hidden_states = None
+
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 hidden_states, residual, mask=mask, inference_params=inference_params
             )
+
+            if return_all_hidden:
+                all_hidden_states[i, :, :, :] = hidden_states
+
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -244,7 +285,7 @@ class MixerModel(nn.Module):
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
             )
-        return hidden_states
+        return hidden_states, all_hidden_states
 
 
 class MambaLMHeadModel(nn.Module, GenerationMixin):
@@ -309,7 +350,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         "position_ids" is just to be compatible with Transformer generation. We don't use it.
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
-        hidden_states = self.backbone(input_ids, mask=attention_mask, inference_params=inference_params)
+        hidden_states, _  = self.backbone(input_ids, mask=attention_mask, inference_params=inference_params)
         if num_last_tokens > 0:
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
