@@ -248,7 +248,7 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, mask=None, inference_params=None):
+    def forward(self, input_ids, mask=None, inference_params=None, return_all_hidden=False):
         batch_size, length = input_ids.shape
         hidden_states = self.embedding(input_ids)
         # add rotary positional embedding
@@ -257,13 +257,18 @@ class MixerModel(nn.Module):
             hidden_states = apply_rotary_pos_emb(hidden_states,pos_emb)
         residual = None
 
-        all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device=input_ids.device)
+        if return_all_hidden: ## only saves it if part of the arguments wants to -- doing this to save space
+            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device=input_ids.device)
+        else:
+            all_hidden_states = None
 
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 hidden_states, residual, mask=mask, inference_params=inference_params
             )
-            all_hidden_states[i, :, :, :] = hidden_states
+
+            if return_all_hidden:
+                all_hidden_states[i, :, :, :] = hidden_states
 
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
