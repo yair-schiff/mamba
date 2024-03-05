@@ -258,7 +258,7 @@ class MixerModel(nn.Module):
         residual = None
 
         if return_all_hidden: ## only saves it if part of the arguments wants to -- doing this to save space
-            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device=input_ids.device)
+            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device='cpu') #input_ids.device
         else:
             all_hidden_states = None
 
@@ -268,7 +268,7 @@ class MixerModel(nn.Module):
             )
 
             if return_all_hidden:
-                all_hidden_states[i, :, :, :] = hidden_states
+                all_hidden_states[i, :, :, :] = hidden_states.to("cpu")
 
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
