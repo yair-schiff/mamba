@@ -248,7 +248,7 @@ class MixerModel(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def forward(self, input_ids, mask=None, inference_params=None, return_all_hidden=False):
+    def forward(self, input_ids, mask=None, inference_params=None, return_all_hidden=False, return_all_hidden_device='cpu'):
         batch_size, length = input_ids.shape
         hidden_states = self.embedding(input_ids)
         # add rotary positional embedding
@@ -258,7 +258,7 @@ class MixerModel(nn.Module):
         residual = None
 
         if return_all_hidden: ## only saves it if part of the arguments wants to -- doing this to save space
-            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device='cpu') #input_ids.device
+            all_hidden_states = torch.zeros(len(self.layers), batch_size, length, hidden_states.size(-1), device=return_all_hidden_device) #input_ids.device
         else:
             all_hidden_states = None
 
@@ -268,7 +268,7 @@ class MixerModel(nn.Module):
             )
 
             if return_all_hidden:
-                all_hidden_states[i, :, :, :] = hidden_states.to("cpu")
+                all_hidden_states[i, :, :, :] = hidden_states.to(return_all_hidden_device)
 
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
@@ -313,6 +313,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+        
+        self.vocab_size = vocab_size
         self.backbone = MixerModel(
             d_model=d_model,
             n_layer=n_layer,
