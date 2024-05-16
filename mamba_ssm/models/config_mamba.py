@@ -15,3 +15,5 @@ class MambaConfig:
     pad_vocab_size_multiple: int = 8
     bidirectional: bool = False
     bidirectional_strategy: Union[str, None] = None
+    use_fast_path: bool = True
+    use_pos_emb: bool = False
